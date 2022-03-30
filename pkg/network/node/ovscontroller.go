@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"k8s.io/klog/v2"
+	"github.com/containernetworking/plugins/pkg/utils/hwaddr"
 
 	osdnv1 "github.com/openshift/api/network/v1"
 	"github.com/openshift/sdn/pkg/network/common"
@@ -171,6 +172,7 @@ type ovsController struct {
 	ovs      ovs.Interface
 	pluginId int
 	localIP  string
+	localMAC     string
 	tunMAC   string
 }
 
@@ -186,7 +188,7 @@ const (
 )
 
 func NewOVSController(ovsif ovs.Interface, pluginId int, localIP string) *ovsController {
-	return &ovsController{ovs: ovsif, pluginId: pluginId, localIP: localIP}
+	return &ovsController{ovs: ovsif, pluginId: pluginId, localIP: localIP, localMAC: ensureLocalMAC(localIP)}
 }
 
 func (oc *ovsController) getVersionNote() string {
@@ -293,6 +295,10 @@ func (oc *ovsController) SetupOVS(clusterNetworkCIDR []string, serviceNetworkCID
 		otx.AddFlow("table=31, priority=100, arp, nw_dst=%s, actions=goto_table:50", clusterCIDR)
 	}
 	otx.AddFlow("table=31, priority=300, ip, nw_dst=%s, actions=output:2", localSubnetGateway)
+	tun0MAC := ensureLocalMAC(localSubnetGateway)
+	if tun0MAC != "" {
+		otx.AddFlow("table=31, priority=301, ip, nw_dst=%s, dl_dst=%s, actions=mod_dl_dst:%s, output:2", localSubnetGateway, oc.localMAC, tun0MAC)
+	}
 	otx.AddFlow("table=31, priority=100, ip, nw_dst=%s, actions=goto_table:60", serviceNetworkCIDR)
 	otx.AddFlow("table=31, priority=250, ip, nw_dst=%s, ct_state=+rpl, actions=ct(nat,table=70)", localSubnetCIDR)
 	otx.AddFlow("table=31, priority=200, ip, nw_dst=%s, actions=goto_table:70", localSubnetCIDR)
@@ -447,7 +453,11 @@ func (oc *ovsController) setupPodFlows(ofport int, podIP net.IP, vnid uint32) er
 
 	ipstr := podIP.String()
 	podIP = podIP.To4()
-	ipmac := fmt.Sprintf("00:00:%02x:%02x:%02x:%02x/00:00:ff:ff:ff:ff", podIP[0], podIP[1], podIP[2], podIP[3])
+	hwAddr, err := hwaddr.GenerateHardwareAddr4(podIP, hwaddr.PrivateMACPrefix)
+	if err != nil {
+		return err
+	}
+	ipmac := hwAddr.String()
 
 	// ARP/IP traffic from container
 	otx.AddFlow("table=20, priority=100, in_port=%d, arp, nw_src=%s, arp_sha=%s, actions=load:%d->NXM_NX_REG0[], goto_table:30", ofport, ipstr, ipmac, vnid)
@@ -458,6 +468,9 @@ func (oc *ovsController) setupPodFlows(ofport int, podIP net.IP, vnid uint32) er
 	otx.AddFlow("table=40, priority=100, arp, nw_dst=%s, actions=output:%d", ipstr, ofport)
 
 	// IP traffic to container
+	if oc.localMAC != "" {
+		otx.AddFlow("table=70, priority=101, ip, nw_dst=%s, dl_dst=%s, actions=mod_dl_dst:%s, load:%d->NXM_NX_REG1[], load:%d->NXM_NX_REG2[], goto_table:80", ipstr, oc.localMAC, ipmac, vnid, ofport)
+	}
 	otx.AddFlow("table=70, priority=100, ip, nw_dst=%s, actions=load:%d->NXM_NX_REG1[], load:%d->NXM_NX_REG2[], goto_table:80", ipstr, vnid, ofport)
 
 	return otx.Commit()
@@ -922,4 +935,18 @@ func (oc *ovsController) SetNamespaceEgressViaEgressIPs(vnid uint32, egressIPsMe
 		otx.AddFlow("table=101, priority=100,ip,reg0=%d, actions=%sgroup:%d", vnid, commit, vnid)
 	}
 	return otx.Commit()
+}
+
+func ensureLocalMAC(localIP string) string {
+	interfaces, _ := net.Interfaces()
+	for _, interf := range interfaces {
+		if addrs, err := interf.Addrs(); err == nil {
+			for _, addr := range addrs {
+				if strings.Contains(addr.String(), localIP) {
+						return interf.HardwareAddr.String()
+				}
+			}
+		}
+	}
+	return ""
 }
