@@ -1,6 +1,7 @@
 package node
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
@@ -26,6 +27,8 @@ const (
 	maxRetries            = 2
 	defaultKubeletDropBit = 1 << uint32(15) // https://github.com/kubernetes/kubelet/blob/release-1.24/config/v1beta1/types.go#L555
 )
+
+var ErrTestMode = errors.New("test mode")
 
 type egressNode struct {
 	nodeIP  string
@@ -85,21 +88,19 @@ func (eip *egressIPWatcher) Start(osdnInformers osdninformers.SharedInformerFact
 	return nil
 }
 
-func (eip *egressIPWatcher) Synced() {
+func (eip *egressIPWatcher) SyncIPAssignments() error {
 	link, _, err := GetLinkDetails(eip.localIP)
 	if err != nil {
 		// shouldn't happen, but obviously there's nothing to clean up...
-		return
+		return err
 	}
 	label, err := egressIPLabel(link)
 	if err != nil {
-		klog.Errorf("Could not check for stale egress IPs: %v", err)
-		return
+		return fmt.Errorf("could not check for stale egress IPs: %v", err)
 	}
 	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
 	if err != nil {
-		klog.Errorf("Could not check for stale egress IPs: %v", err)
-		return
+		return fmt.Errorf("could not check for stale egress IPs: %v", err)
 	}
 
 	for _, addr := range addrs {
@@ -112,7 +113,14 @@ func (eip *egressIPWatcher) Synced() {
 			}
 		}
 	}
+	return nil
+}
 
+func (eip *egressIPWatcher) Synced() {
+	if err := eip.SyncIPAssignments(); err != nil {
+		klog.Errorf("Failed to sync egress IP assignments %v", err)
+		return
+	}
 	eip.iptables.SyncEgressIPRules()
 }
 
@@ -145,9 +153,16 @@ func (eip *egressIPWatcher) ClaimEgressIP(vnid uint32, egressIP, nodeIP, sdnIP s
 	if nodeIP == eip.localIP {
 		mark := getMarkForVNID(vnid, eip.masqueradeBit)
 		eip.iptablesMark[egressIP] = mark
-		if err := eip.assignEgressIP(egressIP, mark); err != nil {
-			klog.Errorf("Error assigning Egress IP %q: %v", egressIP, err)
+		if err := eip.assignEgressIP(egressIP); err != nil {
+			if !errors.Is(err, ErrTestMode) {
+				klog.Errorf("Error assigning Egress IP %q: %v", egressIP, err)
+			}
+			return
 		}
+		if err := eip.iptables.AddEgressIPRules(egressIP, mark); err != nil {
+			klog.Errorf("Could not add egress IP iptables rule: %v", err)
+		}
+
 	} else {
 		eip.addEgressIP(nodeIP, egressIP, sdnIP)
 	}
@@ -157,8 +172,15 @@ func (eip *egressIPWatcher) ReleaseEgressIP(egressIP, nodeIP string) {
 	if nodeIP == eip.localIP {
 		mark := eip.iptablesMark[egressIP]
 		delete(eip.iptablesMark, egressIP)
-		if err := eip.releaseEgressIP(egressIP, mark); err != nil {
-			klog.Errorf("Error releasing Egress IP %q: %v", egressIP, err)
+		if err := eip.unassignEgressIP(egressIP); err != nil {
+			if !errors.Is(err, ErrTestMode) {
+				klog.Errorf("Error releasing Egress IP %q: %v", egressIP, err)
+			}
+			return
+		}
+
+		if err := eip.iptables.DeleteEgressIPRules(egressIP, mark); err != nil {
+			klog.Errorf("Could not delete egress IP iptables rule: %v", err)
 		}
 	} else {
 		eip.removeEgressIP(nodeIP, egressIP)
@@ -308,14 +330,14 @@ func (eip *egressIPWatcher) getEgressLinkDetails() (netlink.Link, *net.IPNet, *n
 	return localEgressLink, localEgressNet, cloudEgressNet, err
 }
 
-func (eip *egressIPWatcher) assignEgressIP(egressIP, mark string) error {
+func (eip *egressIPWatcher) assignEgressIP(egressIP string) error {
 	if egressIP == eip.localIP {
 		return fmt.Errorf("desired egress IP %q is the node IP", egressIP)
 	}
 
 	if eip.testModeChan != nil {
 		eip.testModeChan <- fmt.Sprintf("claim %s", egressIP)
-		return nil
+		return ErrTestMode
 	}
 
 	localEgressLink, localEgressNet, cloudEgressNet, err := eip.getEgressLinkDetails()
@@ -357,21 +379,17 @@ func (eip *egressIPWatcher) assignEgressIP(egressIP, mark string) error {
 		_ = exec.Command("/sbin/arping", "-q", "-U", "-c", "1", "-I", localEgressLink.Attrs().Name, egressIP).Run()
 	}()
 
-	if err := eip.iptables.AddEgressIPRules(egressIP, mark); err != nil {
-		return fmt.Errorf("could not add egress IP iptables rule: %v", err)
-	}
-
 	return nil
 }
 
-func (eip *egressIPWatcher) releaseEgressIP(egressIP, mark string) error {
+func (eip *egressIPWatcher) unassignEgressIP(egressIP string) error {
 	if egressIP == eip.localIP {
 		return nil
 	}
 
 	if eip.testModeChan != nil {
 		eip.testModeChan <- fmt.Sprintf("release %s", egressIP)
-		return nil
+		return ErrTestMode
 	}
 
 	localEgressLink, localEgressNet, err := GetLinkDetails(eip.localIP)
@@ -392,10 +410,6 @@ func (eip *egressIPWatcher) releaseEgressIP(egressIP, mark string) error {
 		} else {
 			return fmt.Errorf("could not delete egress IP %q from %s: %v", egressIPNet, localEgressLink.Attrs().Name, err)
 		}
-	}
-
-	if err := eip.iptables.DeleteEgressIPRules(egressIP, mark); err != nil {
-		return fmt.Errorf("could not delete egress IP iptables rule: %v", err)
 	}
 
 	return nil
